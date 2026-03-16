@@ -5,8 +5,9 @@
 import sys
 import os
 
-SPEC = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(SPEC)
+# PyInstaller передаёт SPEC (путь к spec-файлу); __file__ может быть не определён
+SPEC_DIR = os.path.dirname(SPEC)
+ROOT = os.path.dirname(SPEC_DIR)
 
 block_cipher = None
 

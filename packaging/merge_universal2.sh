@@ -1,6 +1,8 @@
 #!/bin/bash
 # Merge arm64 and x86_64 .app bundles into a universal2 .app and create DMG
-set -e
+set -euo pipefail
+
+trap 'echo "merge_universal2.sh failed at line $LINENO" >&2' ERR
 
 ARM_APP="$1"
 INTEL_APP="$2"
@@ -16,6 +18,42 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 DIST_DIR="$PROJECT_DIR/dist"
 APP_NAME="$(basename "$OUT_APP" .app)"
 DMG_NAME="TgWsProxy"
+
+echo "Starting universal2 merge"
+echo "ARM_APP=$ARM_APP"
+echo "INTEL_APP=$INTEL_APP"
+echo "OUT_APP=$OUT_APP"
+echo "DIST_DIR=$DIST_DIR"
+
+if [ ! -d "$ARM_APP" ]; then
+    echo "ARM app bundle not found: $ARM_APP" >&2
+    exit 1
+fi
+
+if [ ! -d "$INTEL_APP" ]; then
+    echo "Intel app bundle not found: $INTEL_APP" >&2
+    exit 1
+fi
+
+has_arch() {
+    local arches="$1"
+    local target="$2"
+    for arch in $arches; do
+        if [ "$arch" = "$target" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_subset() {
+    local subset="$1"
+    local superset="$2"
+    for arch in $subset; do
+        has_arch "$superset" "$arch" || return 1
+    done
+    return 0
+}
 
 # --- Merge ---
 
@@ -33,11 +71,25 @@ find "$OUT_APP" -type f | while read -r file; do
     if file "$file" | grep -qE "Mach-O (64-bit )?executable|Mach-O (64-bit )?dynamically linked|Mach-O (64-bit )?bundle"; then
         arm_arch=$(lipo -archs "$file" 2>/dev/null || echo "")
         intel_arch=$(lipo -archs "$intel_file" 2>/dev/null || echo "")
-        if [ "$arm_arch" = "$intel_arch" ]; then
-            # same arch (e.g. local test with two arm64 copies) — skip
+        echo "Processing Mach-O: $rel"
+        echo "  arm_arch=$arm_arch"
+        echo "  intel_arch=$intel_arch"
+        if [ -z "$arm_arch" ] || [ -z "$intel_arch" ]; then
+            echo "  action=skip (unable to determine architecture)"
             continue
         fi
+        if is_subset "$intel_arch" "$arm_arch"; then
+            echo "  action=skip (arm binary already contains intel slices)"
+            continue
+        fi
+        if is_subset "$arm_arch" "$intel_arch"; then
+            echo "  action=copy-intel (intel binary is a superset)"
+            cp "$intel_file" "$file"
+            continue
+        fi
+        echo "  action=lipo-create"
         lipo -create "$file" "$intel_file" -output "$file"
+        echo "  merged_arch=$(lipo -archs "$file" 2>/dev/null || echo "")"
     fi
 done
 

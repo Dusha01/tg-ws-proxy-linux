@@ -372,17 +372,14 @@ def _osascript_input(prompt: str, default: str,
     title_esc = title.replace('\\', '\\\\').replace('"', '\\"')
     r = subprocess.run(
         ['osascript', '-e',
-         f'display dialog "{prompt_esc}" '
+         f'text returned of (display dialog "{prompt_esc}" '
          f'default answer "{default_esc}" '
          f'with title "{title_esc}" '
-         f'buttons {{"Отмена", "OK"}} default button "OK"'],
+         f'buttons {{"Отмена", "OK"}} default button "OK")'],
         capture_output=True, text=True)
     if r.returncode != 0:
         return None
-    for part in r.stdout.strip().split(', '):
-        if part.startswith('text returned:'):
-            return part[len('text returned:'):]
-    return None
+    return r.stdout.rstrip("\r\n")
 
 
 def _on_edit_config(_=None):

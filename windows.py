@@ -3,22 +3,27 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+import logging.handlers
 import os
+import winreg
 import psutil
 import sys
 import threading
 import time
 import webbrowser
-import pystray
 import pyperclip
 import asyncio as _asyncio
-import customtkinter as ctk
 from pathlib import Path
 from typing import Dict, Optional
+
+import pystray
+import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont
 
 import proxy.tg_ws_proxy as tg_ws_proxy
 
+
+IS_FROZEN = bool(getattr(sys, "frozen", False))
 
 APP_NAME = "TgWsProxy"
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
@@ -33,6 +38,10 @@ DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "dc_ip": ["2:149.154.167.220", "4:149.154.167.220"],
     "verbose": False,
+    "autostart": False,
+    "log_max_mb": 5,
+    "buf_kb": 256,
+    "pool_size": 4,
 }
 
 
@@ -143,12 +152,17 @@ def save_config(cfg: dict):
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
-def setup_logging(verbose: bool = False):
+def setup_logging(verbose: bool = False, log_max_mb: float = 5):
     _ensure_dirs()
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
 
-    fh = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+    fh = logging.handlers.RotatingFileHandler(
+        str(LOG_FILE),
+        maxBytes=max(32 * 1024, log_max_mb * 1024 * 1024),
+        backupCount=0,
+        encoding='utf-8',
+    )
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s  %(levelname)-5s  %(name)s  %(message)s",
@@ -162,6 +176,64 @@ def setup_logging(verbose: bool = False):
             "%(asctime)s  %(levelname)-5s  %(message)s",
             datefmt="%H:%M:%S"))
         root.addHandler(ch)
+
+
+def _autostart_reg_name() -> str:
+    return APP_NAME
+
+
+def _supports_autostart() -> bool:
+    return IS_FROZEN
+
+
+def _autostart_command() -> str:
+    return f'"{sys.executable}"'
+
+
+def is_autostart_enabled() -> bool:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_READ,
+        ) as k:
+            val, _ = winreg.QueryValueEx(k, _autostart_reg_name())
+        stored = str(val).strip()
+        expected = _autostart_command().strip()
+        return stored == expected
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def set_autostart_enabled(enabled: bool) -> None:
+    try:
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+        ) as k:
+            if enabled:
+                winreg.SetValueEx(
+                    k,
+                    _autostart_reg_name(),
+                    0,
+                    winreg.REG_SZ,
+                    _autostart_command(),
+                )
+            else:
+                try:
+                    winreg.DeleteValue(k, _autostart_reg_name())
+                except FileNotFoundError:
+                    pass
+    except OSError as exc:
+        log.error("Failed to update autostart: %s", exc)
+        _show_error(
+            "Не удалось изменить автозапуск.\n\n"
+            "Попробуйте запустить приложение от имени пользователя с правами на реестр.\n\n"
+            f"Ошибка: {exc}"
+        )
 
 
 def _make_icon_image(size: int = 64):
@@ -238,6 +310,13 @@ def start_proxy():
         return
 
     log.info("Starting proxy on %s:%d ...", host, port)
+
+    buf_kb = cfg.get("buf_kb", DEFAULT_CONFIG["buf_kb"])
+    pool_size = cfg.get("pool_size", DEFAULT_CONFIG["pool_size"])
+    tg_ws_proxy._RECV_BUF = max(4, buf_kb) * 1024
+    tg_ws_proxy._SEND_BUF = tg_ws_proxy._RECV_BUF
+    tg_ws_proxy._WS_POOL_SIZE = max(0, pool_size)
+
     _proxy_thread = threading.Thread(
         target=_run_proxy_thread,
         args=(port, dc_opt, verbose, host),
@@ -306,6 +385,12 @@ def _edit_config_dialog():
         return
 
     cfg = dict(_config)
+    cfg["autostart"] = is_autostart_enabled()
+
+    # Make sure that the autostart key is removed if autostart 
+    # is disabled, even if the executable file is moved.
+    if _supports_autostart() and not cfg["autostart"]:
+        set_autostart_enabled(False)
 
     ctk.set_appearance_mode("light")
     ctk.set_default_color_theme("blue")
@@ -314,6 +399,8 @@ def _edit_config_dialog():
     root.title("TG WS Proxy — Настройки")
     root.resizable(False, False)
     root.attributes("-topmost", True)
+    icon_path = str(Path(__file__).parent / "icon.ico")
+    root.iconbitmap(icon_path)
 
     TG_BLUE = "#3390ec"
     TG_BLUE_HOVER = "#2b7cd4"
@@ -324,7 +411,11 @@ def _edit_config_dialog():
     TEXT_SECONDARY = "#707579"
     FONT_FAMILY = "Segoe UI"
 
-    w, h = 420, 480
+    w, h = 420, 540
+
+    if _supports_autostart(): 
+        h += 70
+
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
     root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
@@ -375,10 +466,42 @@ def _edit_config_dialog():
                     corner_radius=6, border_width=2,
                     border_color=FIELD_BORDER).pack(anchor="w", pady=(0, 8))
 
-    # Info label
-    ctk.CTkLabel(frame, text="Изменения вступят в силу после перезапуска прокси.",
-                 font=(FONT_FAMILY, 11), text_color=TEXT_SECONDARY,
-                 anchor="w").pack(anchor="w", pady=(0, 16))
+    # Advanced: buf_kb, pool_size, log_max_mb
+    adv_frame = ctk.CTkFrame(frame, fg_color="transparent")
+    adv_frame.pack(anchor="w", fill="x", pady=(4, 8))
+
+    for col, (lbl, key, w_) in enumerate([
+        ("Буфер (KB, 256 default)", "buf_kb", 120),
+        ("WS пулов (4 default)", "pool_size", 120),
+        ("Log size (MB, 5 def)", "log_max_mb", 120),
+    ]):
+        col_frame = ctk.CTkFrame(adv_frame, fg_color="transparent")
+        col_frame.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(col_frame, text=lbl, font=(FONT_FAMILY, 11),
+                     text_color=TEXT_SECONDARY, anchor="w").pack(anchor="w")
+        ctk.CTkEntry(col_frame, width=w_, height=30, font=(FONT_FAMILY, 12),
+                     corner_radius=8, fg_color=FIELD_BG,
+                     border_color=FIELD_BORDER, border_width=1,
+                     text_color=TEXT_PRIMARY,
+                     textvariable=ctk.StringVar(
+                         value=str(cfg.get(key, DEFAULT_CONFIG[key]))
+                     )).pack(anchor="w")
+
+    _adv_entries = list(adv_frame.winfo_children())
+    _adv_keys = ["buf_kb", "pool_size", "log_max_mb"]
+
+    autostart_var = None
+    if _supports_autostart():
+        autostart_var = ctk.BooleanVar(value=cfg["autostart"])
+        ctk.CTkCheckBox(frame, text="Автозапуск при включении Windows",
+                        variable=autostart_var, font=(FONT_FAMILY, 13),
+                        text_color=TEXT_PRIMARY,
+                        fg_color=TG_BLUE, hover_color=TG_BLUE_HOVER,
+                        corner_radius=6, border_width=2,
+                        border_color=FIELD_BORDER).pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(frame, text="При перемещении файла или открытии из другой папки\nавтозапуск будет сброшен",
+                 font=(FONT_FAMILY, 13), text_color=TEXT_SECONDARY,
+                 anchor="w", justify="left").pack(anchor="w", pady=(0, 8))
 
     def on_save():
         import socket as _sock
@@ -410,10 +533,25 @@ def _edit_config_dialog():
             "port": port_val,
             "dc_ip": lines,
             "verbose": verbose_var.get(),
+            "autostart": (autostart_var.get() if autostart_var is not None else False),
         }
+
+        for i, key in enumerate(_adv_keys):
+            col_frame = _adv_entries[i]
+            entry = col_frame.winfo_children()[1]
+            try:
+                val = float(entry.get().strip())
+                if key in ("buf_kb", "pool_size"):
+                    val = int(val)
+                new_cfg[key] = val
+            except ValueError:
+                new_cfg[key] = DEFAULT_CONFIG[key]
         save_config(new_cfg)
         _config.update(new_cfg)
         log.info("Config saved: %s", new_cfg)
+
+        if _supports_autostart():
+            set_autostart_enabled(bool(new_cfg.get("autostart", False)))
 
         _tray_icon.menu = _build_menu()
 
@@ -431,18 +569,18 @@ def _edit_config_dialog():
         root.destroy()
 
     btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-    btn_frame.pack(fill="x")
-    ctk.CTkButton(btn_frame, text="Сохранить", width=140, height=38,
+    btn_frame.pack(fill="x", pady=(20, 0))
+    ctk.CTkButton(btn_frame, text="Сохранить", height=38,
                   font=(FONT_FAMILY, 14, "bold"), corner_radius=10,
                   fg_color=TG_BLUE, hover_color=TG_BLUE_HOVER,
                   text_color="#ffffff",
-                  command=on_save).pack(side="left", padx=(0, 10))
-    ctk.CTkButton(btn_frame, text="Отмена", width=140, height=38,
+                  command=on_save).pack(side="left", fill="x", expand=True, padx=(0, 8))
+    ctk.CTkButton(btn_frame, text="Отмена", height=38,
                   font=(FONT_FAMILY, 14), corner_radius=10,
                   fg_color=FIELD_BG, hover_color=FIELD_BORDER,
                   text_color=TEXT_PRIMARY, border_width=1,
                   border_color=FIELD_BORDER,
-                  command=on_cancel).pack(side="left")
+                  command=on_cancel).pack(side="right", fill="x", expand=True)
 
     root.mainloop()
 
@@ -502,6 +640,8 @@ def _show_first_run():
     root.title("TG WS Proxy")
     root.resizable(False, False)
     root.attributes("-topmost", True)
+    icon_path = str(Path(__file__).parent / "icon.ico")
+    root.iconbitmap(icon_path)
 
     w, h = 520, 440
     sw = root.winfo_screenwidth()
@@ -651,7 +791,8 @@ def run_tray():
         except Exception:
             pass
 
-    setup_logging(_config.get("verbose", False))
+    setup_logging(_config.get("verbose", False),
+                  log_max_mb=_config.get("log_max_mb", DEFAULT_CONFIG["log_max_mb"]))
     log.info("TG WS Proxy tray app starting")
     log.info("Config: %s", _config)
     log.info("Log file: %s", LOG_FILE)

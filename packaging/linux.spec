@@ -1,31 +1,37 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Сборка TG WS Proxy для Linux (Debian/Ubuntu)
-# Требует на целевой системе: libappindicator3-1, gir1.2-appindicator3-0.1, libgtk-3-0
 
 import sys
 import os
+import glob
 
-# PyInstaller передаёт SPEC (путь к spec-файлу); __file__ может быть не определён
-SPEC_DIR = os.path.dirname(SPEC)
-ROOT = os.path.dirname(SPEC_DIR)
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 block_cipher = None
 
+# customtkinter ships JSON themes + assets that must be bundled
 import customtkinter
 ctk_path = os.path.dirname(customtkinter.__file__)
+
+# Collect gi (PyGObject) submodules and data so pystray._appindicator works
+gi_hiddenimports = collect_submodules('gi')
+gi_datas = collect_data_files('gi')
+
+# Collect GObject typelib files from the system
+typelib_dirs = glob.glob('/usr/lib/*/girepository-1.0')
+typelib_datas = []
+for d in typelib_dirs:
+    typelib_datas.append((d, 'gi_typelibs'))
+
+SPEC_DIR = os.path.dirname(SPEC)
+ROOT = os.path.dirname(SPEC_DIR)
 
 a = Analysis(
     [os.path.join(ROOT, 'linux.py')],
     pathex=[ROOT],
     binaries=[],
-    datas=[
-        (ctk_path, 'customtkinter/'),
-        (os.path.join(ROOT, 'proxy'), 'proxy'),
-    ],
+    datas=[(ctk_path, 'customtkinter/'), (os.path.join(ROOT, 'proxy'), 'proxy')] + gi_datas + typelib_datas,
     hiddenimports=[
         'pystray._appindicator',
-        'pystray._gtk',
-        'pystray._util.gtk',
         'PIL._tkinter_finder',
         'customtkinter',
         'cryptography.hazmat.primitives.ciphers',
@@ -33,17 +39,24 @@ a = Analysis(
         'cryptography.hazmat.primitives.ciphers.modes',
         'cryptography.hazmat.backends.openssl',
         'gi',
-        'gi.repository.Gtk',
+        '_gi',
         'gi.repository.GLib',
         'gi.repository.GObject',
-    ],
+        'gi.repository.Gtk',
+        'gi.repository.Gdk',
+        'gi.repository.AyatanaAppIndicator3',
+    ] + gi_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    cipher=block_cipher,
     noarchive=False,
+    cipher=block_cipher,
 )
+
+icon_path = os.path.join(SPEC_DIR, '..', 'icon.ico')
+if os.path.exists(icon_path):
+    a.datas += [('icon.ico', icon_path, 'DATA')]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
@@ -54,7 +67,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='tg-ws-proxy',
+    name='TgWsProxy',
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
@@ -63,4 +76,8 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
 )
